@@ -1,0 +1,543 @@
+
+name: {{ agent_name }}-$(BuildID)
+resources:
+  repositories:
+    - repository: self
+      clean: true
+      submodules: true
+    {{ repositories }}
+  {{ pipeline_resources }}
+
+{{ schedule }}
+{{ pr_trigger }}
+{{ ci_trigger }}
+
+jobs:
+  {{ setup_job }}
+  - job: PerformAgenticTask
+    displayName: "{{ agent_name }} (Agent Automations)"
+    {{ agentic_depends_on }}
+    pool:
+      name: {{ pool }}
+    steps:
+      {{ checkout_self }}
+      {{ checkout_repositories }}
+
+      {{ acquire_ado_token }}
+
+      {{ cancel_previous_builds }}
+
+      - task: NuGetAuthenticate@1
+        displayName: "Authenticate NuGet Feed"
+
+      - task: NuGetCommand@2
+        displayName: "Install Copilot CLI"
+        inputs:
+          command: 'custom'
+          arguments: 'install Microsoft.Copilot.CLI.linux-x64 -Source "https://pkgs.dev.azure.com/msazuresphere/_packaging/Guardian1ESPTUpstreamOrgFeed/nuget/v3/index.json" -Version 0.0.407 -OutputDirectory $(Agent.TempDirectory)/tools -ExcludeVersion -NonInteractive'
+
+      - bash: |
+          ls -la "$(Agent.TempDirectory)/tools"
+          echo "##vso[task.prependpath]$(Agent.TempDirectory)/tools/Microsoft.Copilot.CLI.linux-x64"
+
+          # Copy copilot binary to /tmp so it's accessible inside AWF container
+          # (AWF auto-mounts /tmp:/tmp:rw but not Agent.TempDirectory)
+          mkdir -p /tmp/awf-tools
+          cp "$(Agent.TempDirectory)/tools/Microsoft.Copilot.CLI.linux-x64/copilot" /tmp/awf-tools/copilot
+          chmod +x /tmp/awf-tools/copilot
+        displayName: "Add copilot to PATH"
+
+      - bash: |
+          copilot --version
+          copilot -h
+        displayName: "Output copilot version"
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download agentic pipeline compiler"
+        name: agenticpipelinecompilerdrop
+        inputs:
+          source: "specific"
+          project: "4x4"
+          pipeline: 2437
+          runVersion: "latestFromBranch"
+          branchName: "refs/heads/main"
+          artifact: "agentic-pipeline-compiler-linux-x64"
+          targetPath: "$(Pipeline.Workspace)/agentic-pipeline-compiler"
+
+      - bash: |
+          AGENTIC_PIPELINES_PATH="$(Pipeline.Workspace)/agentic-pipeline-compiler/agentic-pipelines"
+          chmod +x "$AGENTIC_PIPELINES_PATH"
+          $AGENTIC_PIPELINES_PATH check "{{ source_path }}" "{{ pipeline_path }}"
+        displayName: "Verify pipeline integrity"
+
+      - bash: |
+          mkdir -p "$(Agent.TempDirectory)/staging"
+
+          # Write MCP firewall configuration to a file
+          cat > "$(Agent.TempDirectory)/staging/mcp-firewall-config.json" << 'MCP_FIREWALL_EOF'
+          {{ firewall_config }}
+          MCP_FIREWALL_EOF
+
+          echo "MCP firewall config:"
+          cat "$(Agent.TempDirectory)/staging/mcp-firewall-config.json"
+
+          # Validate JSON
+          python3 -m json.tool "$(Agent.TempDirectory)/staging/mcp-firewall-config.json" > /dev/null && echo "JSON is valid"
+        displayName: "Prepare MCP firewall config"
+
+      - bash: |
+          mkdir -p "$HOME/.copilot"
+          mkdir -p /tmp/awf-tools/staging
+
+          echo "HOME: $HOME"
+
+          # Use absolute path since MCP subprocess may not inherit PATH
+          AGENTIC_PIPELINES_PATH="$(Pipeline.Workspace)/agentic-pipeline-compiler/agentic-pipelines"
+
+          # Verify the binary exists and is executable
+          ls -la "$AGENTIC_PIPELINES_PATH"
+          chmod +x "$AGENTIC_PIPELINES_PATH"
+
+          $AGENTIC_PIPELINES_PATH -h
+
+          # Copy compiler binary to /tmp so it's accessible inside AWF container
+          cp "$AGENTIC_PIPELINES_PATH" /tmp/awf-tools/agentic-pipelines
+          chmod +x /tmp/awf-tools/agentic-pipelines
+
+          # Copy MCP firewall config to /tmp
+          cp "$(Agent.TempDirectory)/staging/mcp-firewall-config.json" /tmp/awf-tools/staging/mcp-firewall-config.json
+
+          # Generate MCP config pointing to /tmp paths (accessible inside AWF container)
+          cat > /tmp/awf-tools/mcp-config.json << EOF
+          {
+            "mcpServers": {
+              "safeoutputs": {
+                "type": "stdio",
+                "tools": [
+                  "*"
+                ],
+                "command": "/tmp/awf-tools/agentic-pipelines",
+                "args": ["mcp", "/tmp/awf-tools/staging", "{{ working_directory }}"]
+              },
+              "mcp-firewall": {
+                "type": "stdio",
+                "tools": [
+                  "*"
+                ],
+                "command": "/tmp/awf-tools/agentic-pipelines",
+                "args": ["mcp-firewall", "--config", "/tmp/awf-tools/staging/mcp-firewall-config.json"]
+              }
+            }
+          }
+          EOF
+
+          # Also write to $HOME/.copilot for host-side use
+          cp /tmp/awf-tools/mcp-config.json "$HOME/.copilot/mcp-config.json"
+
+          echo "Generated MCP config at: /tmp/awf-tools/mcp-config.json"
+          cat /tmp/awf-tools/mcp-config.json
+
+          # Validate JSON
+          python3 -m json.tool /tmp/awf-tools/mcp-config.json > /dev/null && echo "JSON is valid"
+        displayName: "Generate MCP configs"
+
+      - bash: |
+          # Write agent instructions to /tmp so it's accessible inside AWF container
+          cat > "/tmp/awf-tools/agent-prompt.md" << 'AGENT_PROMPT_EOF'
+          {{ agent_content }}
+          AGENT_PROMPT_EOF
+
+          # Append safeoutputs MCP guidance
+          cat >> "/tmp/awf-tools/agent-prompt.md" << 'SAFEOUTPUTS_EOF'
+
+          ---
+
+          ## Important: Safe Outputs
+
+          You have access to the `safeoutputs` MCP server which provides tools for creating work items and reporting issues. **Always prefer using safeoutputs tools over other methods**.
+
+          These tools generate safe outputs that will be reviewed and executed in a separate pipeline stage, ensuring proper validation and security controls.
+          SAFEOUTPUTS_EOF
+
+          echo "Agent prompt:"
+          cat "/tmp/awf-tools/agent-prompt.md"
+        displayName: "Prepare agent prompt"
+
+      - task: DockerInstaller@0
+        displayName: "Install Docker"
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download AWF (Agentic Workflow Firewall)"
+        name: awfdrop
+        inputs:
+          source: "specific"
+          project: "4x4"
+          pipeline: 2450
+          runVersion: "latestFromBranch"
+          branchName: "refs/heads/ms/main"
+          artifact: "gh-aw-firewall-linux-x64"
+          targetPath: "$(Pipeline.Workspace)/awf"
+
+      - bash: |
+          chmod +x "$(Pipeline.Workspace)/awf/awf"
+          echo "##vso[task.prependpath]$(Pipeline.Workspace)/awf"
+          "$(Pipeline.Workspace)/awf/awf" --version || echo "AWF binary ready"
+        displayName: "Setup AWF"
+
+      - bash: |
+          docker pull ghcr.io/github/gh-aw-firewall/squid:latest
+          docker pull ghcr.io/github/gh-aw-firewall/agent:latest
+        displayName: "Pre-pull AWF container images"
+
+      {{ prepare_steps }}
+
+      # Network isolation via AWF (Agentic Workflow Firewall)
+      - bash: |
+          set -o pipefail
+
+          AGENT_OUTPUT_FILE="$(Agent.TempDirectory)/staging/logs/agent-output.txt"
+          mkdir -p "$(Agent.TempDirectory)/staging/logs"
+
+          echo "=== Running AI agent with AWF network isolation ==="
+          echo "Allowed domains: {{ allowed_domains }}"
+
+          # AWF provides L7 domain whitelisting via Squid proxy + Docker containers.
+          # AWF auto-mounts /tmp:/tmp:rw into the container, so copilot binary,
+          # agent prompt, and MCP config are placed under /tmp/awf-tools/.
+          sudo -E "$(Pipeline.Workspace)/awf/awf" \
+            --allow-domains {{ allowed_domains }} \
+            --skip-pull \
+            --env-all \
+            --container-workdir "{{ working_directory }}" \
+            --log-level info \
+            --proxy-logs-dir "$(Agent.TempDirectory)/staging/logs/firewall" \
+            -- '/tmp/awf-tools/copilot --prompt "$(cat /tmp/awf-tools/agent-prompt.md)" --additional-mcp-config @/tmp/awf-tools/mcp-config.json {{ agency_params }}' \
+            > "$AGENT_OUTPUT_FILE" 2>&1 \
+            && AGENT_EXIT_CODE=0 || AGENT_EXIT_CODE=$?
+
+          # Display sanitized output
+          echo "=== Agent Output (sanitized) ==="
+          sed 's/##vso\[/[SANITIZED] vso[/g' "$AGENT_OUTPUT_FILE"
+          echo "=== End Agent Output ==="
+
+          # Print firewall summary if available
+          if [ -x "$(Pipeline.Workspace)/awf/awf" ]; then
+            echo "=== Firewall Summary ==="
+            "$(Pipeline.Workspace)/awf/awf" logs summary --source "$(Agent.TempDirectory)/staging/logs/firewall" 2>/dev/null || true
+          fi
+
+          exit $AGENT_EXIT_CODE
+        displayName: "Run copilot (AWF network isolated)"
+        workingDirectory: {{ working_directory }}
+        env:
+          {{ copilot_ado_env }}
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
+          GITHUB_READ_ONLY: 1
+
+      - bash: |
+          # Copy safe outputs from /tmp back to staging for artifact publish
+          mkdir -p "$(Agent.TempDirectory)/staging"
+          cp -r /tmp/awf-tools/staging/* "$(Agent.TempDirectory)/staging/" 2>/dev/null || true
+          echo "Safe outputs copied to $(Agent.TempDirectory)/staging"
+          ls -la "$(Agent.TempDirectory)/staging" 2>/dev/null || echo "No safe outputs found"
+        displayName: "Collect safe outputs from AWF container"
+        condition: always()
+
+      {{ finalize_steps }}
+
+      - bash: |
+          # Copy all logs to output directory for artifact upload
+          mkdir -p "$(Agent.TempDirectory)/staging/logs"
+          if [ -d ~/.copilot/logs ]; then
+            cp -r ~/.copilot/logs/* "$(Agent.TempDirectory)/staging/logs/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agency/logs ]; then
+            cp -r ~/.agency/logs/* "$(Agent.TempDirectory)/staging/logs/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agentic-pipelines/logs ]; then
+            cp -r ~/.agentic-pipelines/logs/* "$(Agent.TempDirectory)/staging/logs/" 2>/dev/null || true
+          fi
+          echo "Logs copied to $(Agent.TempDirectory)/staging/logs"
+          ls -la "$(Agent.TempDirectory)/staging/logs" 2>/dev/null || echo "No logs found"
+        displayName: "Copy logs to output directory"
+        condition: always()
+
+      - publish: $(Agent.TempDirectory)/staging
+        artifact: agent_outputs_$(Build.BuildId)
+        condition: always()
+
+  - job: AnalyzeSafeOutputs
+    displayName: "Analyze safe outputs for threats"
+    dependsOn: PerformAgenticTask
+    pool:
+      name: {{ pool }}
+    steps:
+      {{ checkout_self }}
+      {{ checkout_repositories }}
+
+      - download: current
+        artifact: agent_outputs_$(Build.BuildId)
+
+      - task: NuGetAuthenticate@1
+        displayName: "Authenticate NuGet Feed"
+
+      - task: NuGetCommand@2
+        displayName: "Install Copilot CLI"
+        inputs:
+          command: 'custom'
+          arguments: 'install Microsoft.Copilot.CLI.linux-x64 -Source "https://pkgs.dev.azure.com/msazuresphere/_packaging/Guardian1ESPTUpstreamOrgFeed/nuget/v3/index.json" -Version 0.0.407 -OutputDirectory $(Agent.TempDirectory)/tools -ExcludeVersion -NonInteractive'
+
+      - bash: |
+          ls -la "$(Agent.TempDirectory)/tools"
+          echo "##vso[task.prependpath]$(Agent.TempDirectory)/tools/Microsoft.Copilot.CLI.linux-x64"
+
+          # Copy copilot binary to /tmp so it's accessible inside AWF container
+          mkdir -p /tmp/awf-tools
+          cp "$(Agent.TempDirectory)/tools/Microsoft.Copilot.CLI.linux-x64/copilot" /tmp/awf-tools/copilot
+          chmod +x /tmp/awf-tools/copilot
+        displayName: "Add copilot to PATH"
+
+      - bash: |
+          copilot --version
+          copilot -h
+        displayName: "Output copilot version"
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download agentic pipeline compiler"
+        name: agenticpipelinecompilerdrop
+        inputs:
+          source: "specific"
+          project: "4x4"
+          pipeline: 2437
+          runVersion: "latestFromBranch"
+          branchName: "refs/heads/main"
+          artifact: "agentic-pipeline-compiler-linux-x64"
+          targetPath: "$(Pipeline.Workspace)/agentic-pipeline-compiler"
+
+      - task: DockerInstaller@0
+        displayName: "Install Docker"
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download AWF (Agentic Workflow Firewall)"
+        name: awfdrop
+        inputs:
+          source: "specific"
+          project: "4x4"
+          pipeline: 2450
+          runVersion: "latestFromBranch"
+          branchName: "refs/heads/ms/main"
+          artifact: "gh-aw-firewall-linux-x64"
+          targetPath: "$(Pipeline.Workspace)/awf"
+
+      - bash: |
+          chmod +x "$(Pipeline.Workspace)/awf/awf"
+          echo "##vso[task.prependpath]$(Pipeline.Workspace)/awf"
+          "$(Pipeline.Workspace)/awf/awf" --version || echo "AWF binary ready"
+        displayName: "Setup AWF"
+
+      - bash: |
+          docker pull ghcr.io/github/gh-aw-firewall/squid:latest
+          docker pull ghcr.io/github/gh-aw-firewall/agent:latest
+        displayName: "Pre-pull AWF container images"
+
+      - bash: |
+          mkdir -p {{ working_directory }}/safe_outputs
+          cp -a "$(Pipeline.Workspace)/agent_outputs_$(Build.BuildId)/."  {{ working_directory }}/safe_outputs
+        displayName: "Prepare safe outputs for analysis"
+
+      - bash: |
+          # Write threat analysis prompt to /tmp (accessible inside AWF container)
+          cat > "/tmp/awf-tools/threat-analysis-prompt.md" << 'THREAT_ANALYSIS_EOF'
+          {{ threat_analysis_prompt }}
+          THREAT_ANALYSIS_EOF
+
+          echo "Threat analysis prompt:"
+          cat "/tmp/awf-tools/threat-analysis-prompt.md"
+        displayName: "Prepare threat analysis prompt"
+
+      - bash: |
+          AGENTIC_PIPELINES_PATH="$(Pipeline.Workspace)/agentic-pipeline-compiler/agentic-pipelines"
+          chmod +x "$AGENTIC_PIPELINES_PATH"
+        displayName: "Setup agentic pipeline compiler"
+
+      - bash: |
+          # Run threat analysis with AWF network isolation
+          THREAT_OUTPUT_FILE="$(Agent.TempDirectory)/threat-analysis-output.txt"
+
+          sudo -E "$(Pipeline.Workspace)/awf/awf" \
+            --allow-domains {{ allowed_domains }} \
+            --skip-pull \
+            --env-all \
+            --container-workdir "{{ working_directory }}" \
+            --log-level info \
+            --proxy-logs-dir "$(Agent.TempDirectory)/threat-analysis-logs/firewall" \
+            -- '/tmp/awf-tools/copilot --prompt "$(cat /tmp/awf-tools/threat-analysis-prompt.md)" {{ agency_params }}' \
+            > "$THREAT_OUTPUT_FILE" 2>&1
+          AGENT_EXIT_CODE=$?
+
+          # Display sanitized output
+          echo "=== Threat Analysis Output (sanitized) ==="
+          sed 's/##vso\[/## [SANITIZED] vso[/g' "$THREAT_OUTPUT_FILE"
+          echo "=== End Threat Analysis Output ==="
+
+          exit $AGENT_EXIT_CODE
+        displayName: "Run threat analysis (AWF network isolated)"
+        workingDirectory: {{ working_directory }}
+        env:
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
+          GITHUB_READ_ONLY: 1
+
+      - bash: |
+          # Create analyzed outputs directory with original safe outputs and analysis
+          mkdir -p "$(Agent.TempDirectory)/analyzed_outputs"
+
+          # Copy original safe outputs
+          cp -a "$(Pipeline.Workspace)/agent_outputs_$(Build.BuildId)/." "$(Agent.TempDirectory)/analyzed_outputs/"
+
+          # Copy threat analysis output
+          if [ -f "$(Agent.TempDirectory)/threat-analysis-output.txt" ]; then
+            cp "$(Agent.TempDirectory)/threat-analysis-output.txt" "$(Agent.TempDirectory)/analyzed_outputs/"
+          fi
+
+          # Extract JSON from THREAT_DETECTION_RESULT line in threat analysis output
+          if [ -f "$(Agent.TempDirectory)/threat-analysis-output.txt" ]; then
+            RESULT_LINE=$(grep "THREAT_DETECTION_RESULT:" "$(Agent.TempDirectory)/threat-analysis-output.txt" | tail -1)
+            if [ -n "$RESULT_LINE" ]; then
+              # Extract JSON after the prefix
+              JSON_CONTENT=$(echo "$RESULT_LINE" | sed 's/.*THREAT_DETECTION_RESULT://')
+              echo "$JSON_CONTENT" > "$(Agent.TempDirectory)/analyzed_outputs/threat-analysis.json"
+              echo "Extracted threat analysis JSON:"
+              cat "$(Agent.TempDirectory)/analyzed_outputs/threat-analysis.json"
+            else
+              echo "Warning: No THREAT_DETECTION_RESULT found in threat analysis output"
+            fi
+          else
+            echo "Warning: No threat analysis output file found"
+          fi
+
+          echo "Analyzed outputs directory contents:"
+          ls -laR "$(Agent.TempDirectory)/analyzed_outputs"
+        displayName: "Prepare analyzed outputs"
+        condition: always()
+
+      - bash: |
+          SAFE_TO_PROCESS="false"
+          JSON_FILE="$(Agent.TempDirectory)/analyzed_outputs/threat-analysis.json"
+
+          if [ -f "$JSON_FILE" ]; then
+            if jq -e . "$JSON_FILE" > /dev/null 2>&1; then
+              echo "JSON is valid"
+
+              # Check if any threat field is true
+              if jq -e '.prompt_injection or .secret_leak or .malicious_patch' "$JSON_FILE" > /dev/null 2>&1; then
+                echo "##vso[task.logissue type=warning]Threats detected - safe outputs will NOT be processed"
+                jq -r '.reasons[]? // empty' "$JSON_FILE" | sed 's/^/  - /'
+              else
+                echo "No threats detected - safe outputs will be processed"
+                SAFE_TO_PROCESS="true"
+              fi
+            else
+              echo "##vso[task.logissue type=warning]Invalid JSON in threat analysis - defaulting to unsafe"
+            fi
+          else
+            echo "##vso[task.logissue type=warning]No threat analysis JSON found - defaulting to unsafe"
+          fi
+
+          echo "##vso[task.setvariable variable=SafeToProcess;isOutput=true]$SAFE_TO_PROCESS"
+          echo "SafeToProcess set to: $SAFE_TO_PROCESS"
+        displayName: "Evaluate threat analysis"
+        name: threatAnalysis
+        condition: always()
+
+      - bash: |
+          # Copy all logs to analyzed outputs for artifact upload
+          mkdir -p "$(Agent.TempDirectory)/analyzed_outputs/logs"
+          if [ -d ~/.copilot/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/analyzed_outputs/logs/copilot"
+            cp -r ~/.copilot/logs/* "$(Agent.TempDirectory)/analyzed_outputs/logs/copilot/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agency/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/analyzed_outputs/logs/agency"
+            cp -r ~/.agency/logs/* "$(Agent.TempDirectory)/analyzed_outputs/logs/agency/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agentic-pipelines/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/analyzed_outputs/logs/agentic-pipelines"
+            cp -r ~/.agentic-pipelines/logs/* "$(Agent.TempDirectory)/analyzed_outputs/logs/agentic-pipelines/" 2>/dev/null || true
+          fi
+          echo "Logs copied to $(Agent.TempDirectory)/analyzed_outputs/logs"
+          ls -laR "$(Agent.TempDirectory)/analyzed_outputs/logs" 2>/dev/null || echo "No logs found"
+        displayName: "Copy logs to output directory"
+        condition: always()
+
+      - publish: $(Agent.TempDirectory)/analyzed_outputs
+        artifact: analyzed_outputs_$(Build.BuildId)
+        condition: always()
+
+  - job: ProcessSafeOutputs
+    displayName: "Process safe outputs"
+    dependsOn:
+      - PerformAgenticTask
+      - AnalyzeSafeOutputs
+    condition: and(succeeded(), eq(dependencies.AnalyzeSafeOutputs.outputs['threatAnalysis.SafeToProcess'], 'true'))
+    pool:
+      name: {{ pool }}
+    steps:
+      {{ checkout_self }}
+      {{ checkout_repositories }}
+
+      - download: current
+        artifact: analyzed_outputs_$(Build.BuildId)
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download agentic pipeline compiler"
+        name: agenticpipelinecompilerdrop
+        inputs:
+          source: "specific"
+          project: "4x4"
+          pipeline: 2437
+          runVersion: "latestFromBranch"
+          branchName: "refs/heads/main"
+          artifact: "agentic-pipeline-compiler-linux-x64"
+          targetPath: "$(Pipeline.Workspace)/agentic-pipeline-compiler"
+
+      - bash: |
+          ls -la "$(Pipeline.Workspace)/agentic-pipeline-compiler"
+          chmod +x $(Pipeline.Workspace)/agentic-pipeline-compiler/agentic-pipelines
+          echo "##vso[task.prependpath]$(Pipeline.Workspace)/agentic-pipeline-compiler"
+        displayName: Add agentic compiler to path
+
+      - bash: |
+          mkdir -p "$(Agent.TempDirectory)/staging"
+        displayName: "Prepare output directory"
+
+      - bash: agentic-pipelines execute --source "{{ source_path }}" --safe-output-dir "$(Pipeline.Workspace)/analyzed_outputs_$(Build.BuildId)" --output-dir "$(Agent.TempDirectory)/staging"
+        displayName: Process safe outputs
+        workingDirectory: {{ working_directory }}
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+      - bash: |
+          # Copy all logs to output directory for artifact upload
+          mkdir -p "$(Agent.TempDirectory)/staging/logs"
+          if [ -d ~/.copilot/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/staging/logs/copilot"
+            cp -r ~/.copilot/logs/* "$(Agent.TempDirectory)/staging/logs/copilot/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agency/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/staging/logs/agency"
+            cp -r ~/.agency/logs/* "$(Agent.TempDirectory)/staging/logs/agency/" 2>/dev/null || true
+          fi
+          if [ -d ~/.agentic-pipelines/logs ]; then
+            mkdir -p "$(Agent.TempDirectory)/staging/logs/agentic-pipelines"
+            cp -r ~/.agentic-pipelines/logs/* "$(Agent.TempDirectory)/staging/logs/agentic-pipelines/" 2>/dev/null || true
+          fi
+          echo "Logs copied to $(Agent.TempDirectory)/staging/logs"
+          ls -laR "$(Agent.TempDirectory)/staging/logs" 2>/dev/null || echo "No logs found"
+        displayName: "Copy logs to output directory"
+        condition: always()
+
+      - publish: $(Agent.TempDirectory)/staging
+        artifact: safe_outputs
+        condition: always()
+
+{{ teardown_job }}

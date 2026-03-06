@@ -1,0 +1,515 @@
+//! Common helper functions shared across all compile targets.
+
+use anyhow::{Context, Result};
+
+use super::types::{FrontMatter, McpConfig, Repository, TriggerConfig};
+use crate::fuzzy_schedule;
+use crate::mcp_metadata::McpMetadataFile;
+
+/// Check if an MCP name is a built-in (launched via agency mcp)
+pub fn is_builtin_mcp(name: &str) -> bool {
+    let metadata = McpMetadataFile::bundled();
+    metadata.get(name).map(|m| m.builtin).unwrap_or(false)
+}
+
+/// Parse the markdown file and extract front matter and body
+pub fn parse_markdown(content: &str) -> Result<(FrontMatter, String)> {
+    let content = content.trim();
+
+    if !content.starts_with("---") {
+        anyhow::bail!("Markdown file must start with YAML front matter (---)");
+    }
+
+    // Find the closing ---
+    let rest = &content[3..];
+    let end_idx = rest
+        .find("\n---")
+        .context("Could not find closing --- for front matter")?;
+
+    let yaml_content = &rest[..end_idx];
+    let markdown_body = rest[end_idx + 4..].trim();
+
+    let front_matter: FrontMatter =
+        serde_yaml::from_str(yaml_content).context("Failed to parse YAML front matter")?;
+
+    Ok((front_matter, markdown_body.to_string()))
+}
+
+/// Replace a placeholder in the template, preserving the indentation for multi-line content.
+pub fn replace_with_indent(template: &str, placeholder: &str, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = template;
+
+    while let Some(pos) = remaining.find(placeholder) {
+        // Find the start of the current line to determine indentation
+        let line_start = remaining[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent = &remaining[line_start..pos];
+
+        // Only use indent if it's all whitespace
+        let indent = if indent.chars().all(|c| c.is_whitespace()) {
+            indent
+        } else {
+            ""
+        };
+
+        // Add everything before the placeholder
+        result.push_str(&remaining[..pos]);
+
+        // Add the replacement with proper indentation for each line
+        let mut first_line = true;
+        for line in replacement.lines() {
+            if first_line {
+                result.push_str(line);
+                first_line = false;
+            } else {
+                result.push('\n');
+                result.push_str(indent);
+                result.push_str(line);
+            }
+        }
+        // Handle case where replacement ends with newline
+        if replacement.ends_with('\n') {
+            result.push('\n');
+        }
+
+        remaining = &remaining[pos + placeholder.len()..];
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Generate a schedule YAML block from a ScheduleConfig.
+/// When no explicit schedule branches are configured, defaults to `main`.
+pub fn generate_schedule(name: &str, config: &super::types::ScheduleConfig) -> Result<String> {
+    let branches = config.branches();
+    let fallback;
+    let effective_branches = if branches.is_empty() {
+        fallback = vec!["main".to_string()];
+        &fallback
+    } else {
+        branches
+    };
+    fuzzy_schedule::generate_schedule_yaml(config.expression(), name, effective_branches)
+}
+
+/// Generate PR trigger configuration
+pub fn generate_pr_trigger(triggers: &Option<TriggerConfig>, has_schedule: bool) -> String {
+    let has_pipeline_trigger = triggers
+        .as_ref()
+        .and_then(|t| t.pipeline.as_ref())
+        .is_some();
+
+    match (has_pipeline_trigger, has_schedule) {
+        (true, true) => "# Disable PR triggers - only run on schedule or when upstream pipeline completes\npr: none".to_string(),
+        (true, false) => "# Disable PR triggers - only run when upstream pipeline completes\npr: none".to_string(),
+        (false, true) => "# Disable PR triggers - only run on schedule\npr: none".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+/// Generate CI trigger configuration
+pub fn generate_ci_trigger(triggers: &Option<TriggerConfig>, has_schedule: bool) -> String {
+    let has_pipeline_trigger = triggers
+        .as_ref()
+        .and_then(|t| t.pipeline.as_ref())
+        .is_some();
+
+    if has_pipeline_trigger || has_schedule {
+        "trigger: none".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Generate pipeline resource YAML for pipeline completion triggers
+pub fn generate_pipeline_resources(triggers: &Option<TriggerConfig>) -> Result<String> {
+    let Some(trigger_config) = triggers else {
+        return Ok(String::new());
+    };
+
+    let Some(pipeline) = &trigger_config.pipeline else {
+        return Ok(String::new());
+    };
+
+    // Generate a valid resource identifier (snake_case) from the pipeline name
+    let resource_id: String = pipeline
+        .name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+
+    let mut yaml = String::from("pipelines:\n");
+
+    yaml.push_str(&format!("    - pipeline: {}\n", resource_id));
+    yaml.push_str(&format!("      source: '{}'\n", pipeline.name));
+
+    if let Some(project) = &pipeline.project {
+        yaml.push_str(&format!("      project: '{}'\n", project));
+    }
+
+    // If no branches specified, trigger on any branch
+    if pipeline.branches.is_empty() {
+        yaml.push_str("      trigger: true\n");
+    } else {
+        yaml.push_str("      trigger:\n");
+        yaml.push_str("        branches:\n");
+        yaml.push_str("          include:\n");
+        for branch in &pipeline.branches {
+            yaml.push_str(&format!("            - {}\n", branch));
+        }
+    }
+
+    Ok(yaml)
+}
+
+/// Generate a step to cancel previous queued/running builds
+pub fn generate_cancel_previous_builds(triggers: &Option<TriggerConfig>) -> String {
+    let has_pipeline_trigger = triggers
+        .as_ref()
+        .and_then(|t| t.pipeline.as_ref())
+        .is_some();
+
+    if !has_pipeline_trigger {
+        return String::new();
+    }
+
+    r#"- bash: |
+    CURRENT_BUILD_ID=$(Build.BuildId)
+
+    # Get queued or running builds for THIS pipeline definition only
+    BUILDS=$(curl -s -u ":$SYSTEM_ACCESSTOKEN" \
+    "$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds?definitions=$(System.DefinitionId)&statusFilter=notStarted,inProgress&api-version=7.1" \
+    | jq -r --arg current "$CURRENT_BUILD_ID" '.value[] | select(.id != ($current | tonumber)) | .id')
+
+    if [ -z "$BUILDS" ]; then
+    echo "No other queued/running builds to cancel"
+    else
+    for BUILD_ID in $BUILDS; do
+        echo "Cancelling build $BUILD_ID"
+        curl -s -X PATCH -u ":$SYSTEM_ACCESSTOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"status": "cancelling"}' \
+        "$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds/$BUILD_ID?api-version=7.1"
+    done
+    fi
+  displayName: "Cancel previous queued builds"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)"#.to_string()
+}
+
+/// Generate repository resources YAML
+pub fn generate_repositories(repositories: &[Repository]) -> String {
+    if repositories.is_empty() {
+        return String::new();
+    }
+
+    repositories
+        .iter()
+        .map(|repo| {
+            format!(
+                r#"- repository: {}
+      type: {}
+      name: {}
+      ref: {}"#,
+                repo.repository, repo.repo_type, repo.name, repo.repo_ref
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    ")
+}
+
+/// Generate checkout steps YAML
+pub fn generate_checkout_steps(checkout: &[String]) -> String {
+    if checkout.is_empty() {
+        return String::new();
+    }
+
+    checkout
+        .iter()
+        .map(|name| format!("- checkout: {}", name))
+        .collect::<Vec<_>>()
+        .join("\n              ")
+}
+
+/// Generate `checkout: self` step.
+pub fn generate_checkout_self() -> String {
+    "- checkout: self".to_string()
+}
+
+/// Validate that all entries in checkout list exist in repositories
+pub fn validate_checkout_list(repositories: &[Repository], checkout: &[String]) -> Result<()> {
+    if checkout.is_empty() {
+        return Ok(());
+    }
+
+    let repo_names: std::collections::HashSet<_> =
+        repositories.iter().map(|r| r.repository.as_str()).collect();
+
+    for name in checkout {
+        if !repo_names.contains(name.as_str()) {
+            anyhow::bail!(
+                "Checkout entry '{}' not found in repositories. Available: {:?}",
+                name,
+                repo_names
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Default bash commands allowed for agents (matches gh-aw defaults + yq)
+const DEFAULT_BASH_COMMANDS: &[&str] = &[
+    "cat", "date", "echo", "grep", "head", "ls", "pwd", "sort", "tail", "uniq", "wc", "yq",
+];
+
+/// Generate copilot CLI params from front matter configuration
+pub fn generate_copilot_params(front_matter: &FrontMatter) -> String {
+    let mut allowed_tools: Vec<String> = vec![
+        "github".to_string(),
+        "safeoutputs".to_string(),
+    ];
+
+    // Edit tool: enabled by default, can be disabled with `edit: false`
+    let edit_enabled = front_matter
+        .tools
+        .as_ref()
+        .and_then(|t| t.edit)
+        .unwrap_or(true);
+    if edit_enabled {
+        allowed_tools.push("write".to_string());
+    }
+
+    // Bash tool: use configured list, or defaults if not specified
+    let bash_commands: Vec<&str> = match front_matter.tools.as_ref().and_then(|t| t.bash.as_ref()) {
+        Some(cmds) if cmds.len() == 1 && cmds[0] == ":*" => {
+            // Unrestricted: single wildcard entry
+            allowed_tools.push("shell(:*)".to_string());
+            vec![]
+        }
+        Some(cmds) if cmds.is_empty() => {
+            // Explicitly disabled: no bash commands
+            vec![]
+        }
+        Some(cmds) => {
+            // Explicit list of commands
+            cmds.iter().map(|s| s.as_str()).collect()
+        }
+        None => {
+            // Default safe commands
+            DEFAULT_BASH_COMMANDS.to_vec()
+        }
+    };
+    for cmd in bash_commands {
+        allowed_tools.push(format!("shell({})", cmd));
+    }
+
+    let metadata = McpMetadataFile::bundled();
+    let mut disallowed_mcps: Vec<&str> = metadata.mcp_names();
+    disallowed_mcps.sort();
+
+    let mut params = Vec::new();
+
+    params.push(format!("--model {}", front_matter.engine.model()));
+    params.push("--disable-builtin-mcps".to_string());
+    params.push("--no-ask-user".to_string());
+
+    for tool in allowed_tools {
+        if tool.contains('(') || tool.contains(')') || tool.contains(' ') {
+            // Use double quotes - the agency_params are embedded inside a single-quoted
+            // bash string in the AWF command, so single quotes would break quoting.
+            params.push(format!("--allow-tool \"{}\"", tool));
+        } else {
+            params.push(format!("--allow-tool {}", tool));
+        }
+    }
+
+    for mcp in disallowed_mcps {
+        params.push(format!("--disable-mcp-server {}", mcp));
+    }
+
+    for (name, config) in &front_matter.mcp_servers {
+        let is_custom = matches!(config, McpConfig::WithOptions(opts) if opts.command.is_some());
+        if is_custom {
+            continue;
+        }
+
+        let is_enabled = match config {
+            McpConfig::Enabled(enabled) => *enabled,
+            McpConfig::WithOptions(_) => true,
+        };
+
+        if is_enabled {
+            params.push(format!("--mcp {}", name));
+        }
+    }
+
+    params.join(" ")
+}
+
+/// Compute the effective workspace based on explicit setting and checkout configuration.
+pub fn compute_effective_workspace(
+    explicit_workspace: &Option<String>,
+    checkout: &[String],
+    agent_name: &str,
+) -> String {
+    let has_additional_checkouts = !checkout.is_empty();
+
+    match explicit_workspace {
+        Some(ws) if ws == "repo" && !has_additional_checkouts => {
+            eprintln!(
+                "Warning: Agent '{}' has workspace: repo but no additional repositories in checkout. \
+                When only 'self' is checked out, $(Build.SourcesDirectory) already contains the repository content. \
+                The workspace setting has no effect in this case.",
+                agent_name
+            );
+            "repo".to_string()
+        }
+        Some(ws) => ws.clone(),
+        None if has_additional_checkouts => "repo".to_string(),
+        None => "root".to_string(),
+    }
+}
+
+/// Generate working directory based on workspace setting
+pub fn generate_working_directory(effective_workspace: &str) -> String {
+    match effective_workspace {
+        "repo" => "$(Build.SourcesDirectory)/$(Build.Repository.Name)".to_string(),
+        "root" | _ => "$(Build.SourcesDirectory)".to_string(),
+    }
+}
+
+/// Format a single step's YAML string with proper indentation
+pub fn format_step_yaml(step_yaml: &str) -> String {
+    let trimmed = step_yaml.trim();
+    trimmed
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("  - {}", line.trim_start_matches("---").trim())
+            } else {
+                format!("        {}", line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a single step's YAML string with custom base indentation
+pub fn format_step_yaml_indented(step_yaml: &str, base_indent: usize) -> String {
+    let trimmed = step_yaml.trim();
+    let indent = " ".repeat(base_indent);
+    let cont_indent = " ".repeat(base_indent + 2);
+    trimmed
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("{}- {}", indent, line.trim_start_matches("---").trim())
+            } else {
+                format!("{}{}", cont_indent, line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format multiple steps to YAML with proper indentation for jobs
+pub fn format_steps_yaml(steps: &[serde_yaml::Value]) -> String {
+    steps
+        .iter()
+        .filter_map(|step| serde_yaml::to_string(step).ok())
+        .map(|s| format_step_yaml(&s))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format multiple steps to YAML with custom base indentation
+pub fn format_steps_yaml_indented(steps: &[serde_yaml::Value], base_indent: usize) -> String {
+    steps
+        .iter()
+        .filter_map(|step| serde_yaml::to_string(step).ok())
+        .map(|s| format_step_yaml_indented(&s, base_indent))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Sanitize a string to be used as a filename.
+///
+/// Converts to lowercase, replaces non-alphanumeric characters with dashes,
+/// and collapses consecutive dashes into a single dash.
+pub fn sanitize_filename(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Default pool name
+pub const DEFAULT_POOL: &str = "AZS-1ES-L-MMS-ubuntu-22.04";
+
+/// Generate source path for the execute command.
+///
+/// Returns a path using `{{ workspace }}` as the base, which gets resolved
+/// to the correct ADO working directory before this placeholder is replaced.
+pub fn generate_source_path(input_path: &std::path::Path) -> String {
+    let filename = input_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agent.md");
+
+    format!("{{{{ workspace }}}}/agents/{}", filename)
+}
+
+/// Generate the pipeline YAML path for integrity checking at ADO runtime.
+///
+/// Returns a path using `{{ workspace }}` as the base, derived from the
+/// output path's filename so it matches whatever `-o` was specified during compilation.
+pub fn generate_pipeline_path(output_path: &std::path::Path) -> String {
+    let filename = output_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("pipeline.yml");
+
+    format!("{{{{ workspace }}}}/{}", filename)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename_basic() {
+        assert_eq!(sanitize_filename("Daily Code Review"), "daily-code-review");
+        assert_eq!(sanitize_filename("My Agent!"), "my-agent");
+    }
+
+    #[test]
+    fn test_sanitize_filename_collapses_dashes() {
+        assert_eq!(
+            sanitize_filename("Test  Multiple   Spaces"),
+            "test-multiple-spaces"
+        );
+        assert_eq!(sanitize_filename("a---b"), "a-b");
+    }
+
+    #[test]
+    fn test_sanitize_filename_trims_dashes() {
+        assert_eq!(sanitize_filename("--leading"), "leading");
+        assert_eq!(sanitize_filename("trailing--"), "trailing");
+        assert_eq!(sanitize_filename("--both--"), "both");
+    }
+
+    #[test]
+    fn test_sanitize_filename_special_chars() {
+        assert_eq!(sanitize_filename("agent@v1.0"), "agent-v1-0");
+        assert_eq!(sanitize_filename("test_case"), "test-case");
+    }
+}
