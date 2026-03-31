@@ -1,6 +1,8 @@
 mod allowed_hosts;
 mod compile;
+mod configure;
 mod create;
+mod detect;
 mod execute;
 mod fuzzy_schedule;
 mod logging;
@@ -79,6 +81,27 @@ enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Detect agentic pipelines and update GITHUB_TOKEN on their ADO definitions
+    Configure {
+        /// The new GITHUB_TOKEN value (defaults to GITHUB_TOKEN env var; prompted if omitted)
+        #[arg(long, env = "GITHUB_TOKEN")]
+        token: Option<String>,
+        /// Override: Azure DevOps organization URL (inferred from git remote by default)
+        #[arg(long)]
+        org: Option<String>,
+        /// Override: Azure DevOps project name (inferred from git remote by default)
+        #[arg(long)]
+        project: Option<String>,
+        /// PAT for ADO API authentication (prefer setting AZURE_DEVOPS_EXT_PAT env var; prompted if omitted)
+        #[arg(long, env = "AZURE_DEVOPS_EXT_PAT")]
+        pat: Option<String>,
+        /// Path to the repository root (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Preview changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -107,6 +130,7 @@ async fn main() -> Result<()> {
         Some(Commands::Execute { .. }) => "execute",
         Some(Commands::Proxy { .. }) => "proxy",
         Some(Commands::McpFirewall { .. }) => "mcp-firewall",
+        Some(Commands::Configure { .. }) => "configure",
         None => "ado-aw",
     };
 
@@ -230,6 +254,24 @@ async fn main() -> Result<()> {
             }
             Commands::McpFirewall { config } => {
                 mcp_firewall::run(&config).await?;
+            }
+            Commands::Configure {
+                token,
+                org,
+                project,
+                pat,
+                path,
+                dry_run,
+            } => {
+                configure::run(
+                    token.as_deref(),
+                    org.as_deref(),
+                    project.as_deref(),
+                    pat.as_deref(),
+                    path.as_deref(),
+                    dry_run,
+                )
+                .await?;
             }
         }
     } else {
