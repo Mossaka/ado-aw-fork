@@ -500,26 +500,112 @@ pub fn generate_header_comment(input_path: &std::path::Path) -> String {
 ///
 /// Returns a path using `{{ workspace }}` as the base, which gets resolved
 /// to the correct ADO working directory before this placeholder is replaced.
+///
+/// The full relative path of the input file is preserved so that agents compiled
+/// from subdirectories (e.g. `ado-aw compile agents/ctf.md`) produce a correct
+/// runtime path (`$(Build.SourcesDirectory)/agents/ctf.md`) rather than a path
+/// that drops the directory component.
+///
+/// Absolute paths fall back to using only the filename to avoid embedding
+/// machine-specific paths in the generated pipeline.
 pub fn generate_source_path(input_path: &std::path::Path) -> String {
-    let filename = input_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("agent.md");
+    let relative = normalize_relative_path(input_path).unwrap_or_else(|| {
+        input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("agent.md")
+            .to_string()
+    });
 
-    format!("{{{{ workspace }}}}/agents/{}", filename)
+    format!("{{{{ workspace }}}}/{}", relative)
 }
 
 /// Generate the pipeline YAML path for integrity checking at ADO runtime.
 ///
 /// Returns a path using `{{ workspace }}` as the base, derived from the
-/// output path's filename so it matches whatever `-o` was specified during compilation.
+/// output path so it matches whatever `-o` was specified during compilation.
+///
+/// The full relative path is preserved so that pipelines compiled into
+/// subdirectories (e.g. `agents/ctf.yml`) produce a correct runtime path
+/// (`$(Build.SourcesDirectory)/agents/ctf.yml`) rather than a path that
+/// drops the directory component.
+///
+/// Absolute paths fall back to using only the filename to avoid embedding
+/// machine-specific paths in the generated pipeline.
 pub fn generate_pipeline_path(output_path: &std::path::Path) -> String {
-    let filename = output_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("pipeline.yml");
+    let relative = normalize_relative_path(output_path).unwrap_or_else(|| {
+        output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("pipeline.yml")
+            .to_string()
+    });
 
-    format!("{{{{ workspace }}}}/{}", filename)
+    format!("{{{{ workspace }}}}/{}", relative)
+}
+
+/// Normalize a path for embedding in a generated pipeline.
+///
+/// Returns `Some(String)` when `path` is relative, with:
+/// - Backslashes converted to forward slashes
+/// - Redundant leading `./` prefixes stripped
+///
+/// For absolute paths the function first tries to compute a relative path from
+/// the nearest git repository root (found by walking up the directory tree
+/// looking for a `.git` entry).  This preserves the directory structure when
+/// the user passes an absolute path — e.g.
+/// `/home/user/repo/agents/ctf.md` → `agents/ctf.md`.
+///
+/// Falls back to `None` (callers use filename-only) only when no git root is
+/// found, to avoid embedding machine-specific absolute paths in the generated
+/// pipeline YAML.
+///
+/// Note: `..` components in relative paths are passed through unchanged.
+/// Callers are responsible for ensuring the path does not traverse outside the
+/// repository checkout.
+fn normalize_relative_path(path: &std::path::Path) -> Option<String> {
+    if path.is_absolute() {
+        // Try to make the path relative to the nearest git repo root so that
+        // directory structure (e.g. `agents/ctf.md`) is preserved even when
+        // the user invokes the compiler with an absolute path.
+        if let Some(git_root) = find_git_root(path) {
+            if let Ok(rel) = path.strip_prefix(&git_root) {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                return Some(s);
+            }
+        }
+        return None;
+    }
+
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    while let Some(stripped) = s.strip_prefix("./") {
+        s = stripped.to_string();
+    }
+    Some(s)
+}
+
+/// Walk up the directory tree from `path` looking for a `.git` entry.
+///
+/// Returns the first ancestor directory that contains `.git`, or `None` if the
+/// traversal reaches the filesystem root without finding one.
+fn find_git_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Start from the file's parent directory (or the path itself if it is a dir).
+    let start: &std::path::Path = if path.is_dir() {
+        path
+    } else {
+        path.parent()?
+    };
+
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => return None,
+        }
+    }
 }
 
 // ==================== Permission helpers ====================
@@ -1066,5 +1152,113 @@ mod tests {
             "Single ./ prefix should be stripped: {}",
             header
         );
+    }
+
+    // ─── generate_source_path ────────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_source_path_preserves_directory() {
+        // Compiling agents/ctf.md should produce {{ workspace }}/agents/ctf.md,
+        // not {{ workspace }}/agents/ctf.md with a hardcoded agents/ prefix.
+        let path = std::path::Path::new("agents/ctf.md");
+        let result = generate_source_path(path);
+        assert_eq!(result, "{{ workspace }}/agents/ctf.md");
+    }
+
+    #[test]
+    fn test_generate_source_path_nested_directory() {
+        let path = std::path::Path::new("pipelines/production/review.md");
+        let result = generate_source_path(path);
+        assert_eq!(result, "{{ workspace }}/pipelines/production/review.md");
+    }
+
+    #[test]
+    fn test_generate_source_path_strips_dot_slash() {
+        let path = std::path::Path::new("./agents/my-agent.md");
+        let result = generate_source_path(path);
+        assert_eq!(result, "{{ workspace }}/agents/my-agent.md");
+    }
+
+    #[test]
+    fn test_generate_source_path_filename_only() {
+        let path = std::path::Path::new("my-agent.md");
+        let result = generate_source_path(path);
+        assert_eq!(result, "{{ workspace }}/my-agent.md");
+    }
+
+    // ─── generate_pipeline_path ──────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_pipeline_path_preserves_directory() {
+        // The original bug: compiling agents/ctf.md produced agents/ctf.yml as
+        // output, but the embedded path was only ctf.yml (missing agents/).
+        let path = std::path::Path::new("agents/ctf.yml");
+        let result = generate_pipeline_path(path);
+        assert_eq!(result, "{{ workspace }}/agents/ctf.yml");
+    }
+
+    #[test]
+    fn test_generate_pipeline_path_nested_directory() {
+        let path = std::path::Path::new("pipelines/production/review.yml");
+        let result = generate_pipeline_path(path);
+        assert_eq!(result, "{{ workspace }}/pipelines/production/review.yml");
+    }
+
+    #[test]
+    fn test_generate_pipeline_path_strips_dot_slash() {
+        let path = std::path::Path::new("./agents/my-agent.yml");
+        let result = generate_pipeline_path(path);
+        assert_eq!(result, "{{ workspace }}/agents/my-agent.yml");
+    }
+
+    #[test]
+    fn test_generate_pipeline_path_filename_only() {
+        let path = std::path::Path::new("pipeline.yml");
+        let result = generate_pipeline_path(path);
+        assert_eq!(result, "{{ workspace }}/pipeline.yml");
+    }
+
+    #[test]
+    fn test_generate_source_path_absolute_falls_back_to_filename() {
+        // /home/user/agents/ctf.md is not inside a git repo, so we fall back
+        // to filename-only to avoid embedding a machine-specific absolute path.
+        let path = std::path::Path::new("/home/user/agents/ctf.md");
+        let result = generate_source_path(path);
+        assert_eq!(result, "{{ workspace }}/ctf.md");
+    }
+
+    #[test]
+    fn test_generate_pipeline_path_absolute_falls_back_to_filename() {
+        let path = std::path::Path::new("/home/user/agents/ctf.yml");
+        let result = generate_pipeline_path(path);
+        assert_eq!(result, "{{ workspace }}/ctf.yml");
+    }
+
+    #[test]
+    fn test_generate_source_path_absolute_with_git_root_preserves_directory() {
+        // When the absolute path is inside a git repo, the directory structure
+        // relative to the repo root must be preserved.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // A `.git` file (as used in worktrees) satisfies `.exists()` just like
+        // a `.git` directory, so either form is a valid marker.
+        fs::write(tmp.path().join(".git"), "gitdir: fake").unwrap();
+        let abs_path = agents_dir.join("ctf.md");
+        let result = generate_source_path(&abs_path);
+        assert_eq!(result, "{{ workspace }}/agents/ctf.md");
+    }
+
+    #[test]
+    fn test_generate_pipeline_path_absolute_with_git_root_preserves_directory() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(tmp.path().join(".git"), "gitdir: fake").unwrap();
+        let abs_path = agents_dir.join("ctf.yml");
+        let result = generate_pipeline_path(&abs_path);
+        assert_eq!(result, "{{ workspace }}/agents/ctf.yml");
     }
 }
