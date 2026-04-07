@@ -310,6 +310,28 @@ pub fn generate_copilot_params(front_matter: &FrontMatter) -> String {
     let mut params = Vec::new();
 
     params.push(format!("--model {}", front_matter.engine.model()));
+    if let Some(max_turns) = front_matter.engine.max_turns() {
+        if max_turns == 0 {
+            eprintln!(
+                "Warning: Agent '{}' has max-turns: 0, which means zero turns allowed. \
+                The agent will not be able to perform any tool calls. \
+                Consider setting max-turns to at least 1.",
+                front_matter.name
+            );
+        }
+        params.push(format!("--max-turns {}", max_turns));
+    }
+    if let Some(timeout_minutes) = front_matter.engine.timeout_minutes() {
+        if timeout_minutes == 0 {
+            eprintln!(
+                "Warning: Agent '{}' has timeout-minutes: 0, which means no time is allowed. \
+                The agent session will time out immediately. \
+                Consider setting timeout-minutes to at least 1.",
+                front_matter.name
+            );
+        }
+        params.push(format!("--max-timeout {}", timeout_minutes));
+    }
     params.push("--disable-builtin-mcps".to_string());
     params.push("--no-ask-user".to_string());
 
@@ -892,6 +914,60 @@ mod tests {
             .insert("ado".to_string(), McpConfig::Enabled(true));
         let params = generate_copilot_params(&fm);
         assert!(params.contains("--mcp ado"));
+    }
+
+    #[test]
+    fn test_copilot_params_max_turns() {
+        let (fm, _) = parse_markdown(
+            "---\nname: test\ndescription: test\nengine:\n  model: claude-opus-4.5\n  max-turns: 50\n---\n",
+        )
+        .unwrap();
+        let params = generate_copilot_params(&fm);
+        assert!(params.contains("--max-turns 50"));
+    }
+
+    #[test]
+    fn test_copilot_params_no_max_turns_when_simple_engine() {
+        let fm = minimal_front_matter();
+        let params = generate_copilot_params(&fm);
+        assert!(!params.contains("--max-turns"));
+    }
+
+    #[test]
+    fn test_copilot_params_max_timeout() {
+        let (fm, _) = parse_markdown(
+            "---\nname: test\ndescription: test\nengine:\n  model: claude-opus-4.5\n  timeout-minutes: 30\n---\n",
+        )
+        .unwrap();
+        let params = generate_copilot_params(&fm);
+        assert!(params.contains("--max-timeout 30"));
+    }
+
+    #[test]
+    fn test_copilot_params_no_max_timeout_when_simple_engine() {
+        let fm = minimal_front_matter();
+        let params = generate_copilot_params(&fm);
+        assert!(!params.contains("--max-timeout"));
+    }
+
+    #[test]
+    fn test_copilot_params_max_turns_zero_still_emitted() {
+        let (fm, _) = parse_markdown(
+            "---\nname: test\ndescription: test\nengine:\n  model: claude-opus-4.5\n  max-turns: 0\n---\n",
+        )
+        .unwrap();
+        let params = generate_copilot_params(&fm);
+        assert!(params.contains("--max-turns 0"));
+    }
+
+    #[test]
+    fn test_copilot_params_max_timeout_zero_still_emitted() {
+        let (fm, _) = parse_markdown(
+            "---\nname: test\ndescription: test\nengine:\n  model: claude-opus-4.5\n  timeout-minutes: 0\n---\n",
+        )
+        .unwrap();
+        let params = generate_copilot_params(&fm);
+        assert!(params.contains("--max-timeout 0"));
     }
 
     // ─── sanitize_filename ────────────────────────────────────────────────────
