@@ -398,7 +398,7 @@ The compiler transforms the input into valid Azure DevOps pipeline YAML based on
 - **Standalone**: Uses `templates/base.yml`
 - **1ES**: Uses `templates/1es-base.yml`
 
-Explicit markings are embedded in these templates that the compiler is allowed to replace e.g. `{{ agency_params }}` denotes parameters which are passed to the agency command line tool. The compiler should not replace sections denoted by `${{ some content }}`. What follows is a mapping of markings to responsibilities (primarily for the standalone template).
+Explicit markings are embedded in these templates that the compiler is allowed to replace e.g. `{{ copilot_params }}` denotes parameters which are passed to the copilot command line tool. The compiler should not replace sections denoted by `${{ some content }}`. What follows is a mapping of markings to responsibilities (primarily for the standalone template).
 
 ## {{ repositories }}
 For each additional repository specified in the front matter append:
@@ -467,17 +467,16 @@ This distinction allows resources (like templates) to be available as pipeline r
 
 Should be replaced with the human-readable name from the front matter (e.g., "Daily Code Review"). This is used for display purposes like stage names.
 
-## {{ agency_params }}
+## {{ copilot_params }}
 
-Additional params provided to agency CLI. The compiler generates:
+Additional params provided to copilot CLI. The compiler generates:
 - `--model <model>` - AI model from `engine` front matter field (default: claude-opus-4.5)
 - `--disable-builtin-mcps` - Disables all built-in MCPs initially
 - `--no-ask-user` - Prevents interactive prompts
 - `--allow-tool <tool>` - Explicitly allows specific tools (github, safeoutputs, write, shell commands like cat, date, echo, grep, head, ls, pwd, sort, tail, uniq, wc, yq)
-- `--disable-mcp-server <name>` - Disables specific MCPs (all built-in MCPs are disabled by default and must be explicitly enabled via mcp-servers config)
-- `--mcp <name>` - Enables MCPs specified in front matter
+- `--disable-mcp-server <name>` - Disables specific Copilot CLI MCPs
 
-Only built-in MCPs are passed via params. Custom MCPs (with command field) are handled separately.
+All MCPs (both built-in and custom) are handled via the MCP firewall config, not via `--mcp` flags.
 
 ## {{ pool }}
 
@@ -552,7 +551,7 @@ Should be replaced with the appropriate working directory based on the effective
 - `root`: `$(Build.SourcesDirectory)` - the checkout root directory
 - `repo`: `$(Build.SourcesDirectory)/$(Build.Repository.Name)` - the repository's subfolder
 
-This is used for the `workingDirectory` property of the agency copilot task.
+This is used for the `workingDirectory` property of the copilot task.
 
 ## {{ source_path }}
 
@@ -726,16 +725,16 @@ Should be replaced with the agent context root for 1ES Agency jobs. This determi
 
 ## {{ mcp_configuration }}
 
-Should be replaced with the MCP server configuration for 1ES templates. For each enabled built-in MCP, generates service connection references:
+Should be replaced with the MCP server configuration for 1ES templates. For each `mcp-servers:` entry without a `command:` field, generates a service connection reference using the entry name:
 
 ```yaml
-ado:
-  serviceConnection: mcp-ado-service-connection
-kusto:
-  serviceConnection: mcp-kusto-service-connection
+my-mcp:
+  serviceConnection: mcp-my-mcp-service-connection
+other-mcp:
+  serviceConnection: mcp-other-mcp-service-connection
 ```
 
-Custom MCP servers (with `command:` field) are not supported in 1ES target. Only built-in MCPs with corresponding service connections are supported.
+Custom MCP servers (with `command:` field) are not supported in 1ES target. Only entries without a `command:` (which have a corresponding service connection) are supported.
 
 ## {{ global_options }}
 
@@ -1119,30 +1118,7 @@ cargo add <crate-name>
 
 ## MCP Configuration
 
-The `mcp-servers:` field provides a unified way to configure both built-in and custom MCP (Model Context Protocol) servers. The compiler distinguishes between them by checking for the `command:` field—if present, it's a custom server; otherwise, it's a built-in.
-
-### Built-in MCP Servers
-
-Enable built-in servers with `true` or configure them with options:
-
-```yaml
-mcp-servers:
-  ado: true                    # enabled with all default functions
-  ado-ext: true                # Extended ADO functionality
-  asa: true                    # Azure Stream Analytics MCP
-  bluebird: true               # Bluebird MCP
-  calculator: true             # Calculator MCP
-  es-chat: true
-  icm:                         # enabled with restricted functions
-    allowed:
-      - create_incident
-      - get_incident
-  kusto:
-    allowed:
-      - query
-  msft-learn: true
-  stack: true                  # Stack MCP
-```
+The `mcp-servers:` field configures custom MCP (Model Context Protocol) servers that the agent can use. Each entry must include a `command:` field specifying the executable to spawn.
 
 ### Custom MCP Servers
 
@@ -1160,28 +1136,16 @@ mcp-servers:
 
 ### Configuration Properties
 
-**For built-in MCPs:**
-- `true` - Enable with all default functions
-- `allowed:` - Array of function names to restrict available tools
-- `service-connection:` - (1ES target only) Override the service connection name used for this MCP. If not specified, defaults to `mcp-<name>-service-connection` (e.g., `mcp-ado-service-connection` for the `ado` MCP)
-
-**For custom MCPs (requires `command:`):**
 - `command:` - The executable to run (e.g., `"node"`, `"python"`, `"dotnet"`)
 - `args:` - Array of command-line arguments passed to the command
 - `allowed:` - Array of function names agents are permitted to call (required for security)
 - `env:` - Optional environment variables for the MCP server process
+- `service-connection:` - (1ES target only) Override the service connection name used for this MCP. If not specified, defaults to `mcp-<name>-service-connection`
 
-### Example: Mixed Configuration
+### Example: Multiple Custom MCP Servers
 
 ```yaml
 mcp-servers:
-  # Built-in servers
-  ado: true
-  ado-ext: true
-  es-chat: true
-  icm:
-    allowed: [create_incident, get_incident]
-
   # Custom Python MCP server
   data-processor:
     command: "python"
@@ -1207,7 +1171,6 @@ mcp-servers:
 2. **Command Validation**: The compiler validates that commands are from a trusted set
 3. **Argument Sanitization**: Arguments are validated to prevent injection attacks
 4. **Environment Isolation**: MCP servers run in the same isolated sandbox as the pipeline
-5. **Built-in Trust**: Built-in MCPs are pre-vetted; custom MCPs require explicit `allowed:` list
 
 ## Network Isolation (AWF)
 
@@ -1323,17 +1286,13 @@ When agents are configured with multiple MCPs (e.g., `ado`, `kusto`, `icm`), the
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│             │     │                  │     │  ado MCP        │
-│   Agent     │────▶│   MCP Firewall   │────▶│  (agency mcp ado)│
-│  (Agency)   │     │                  │     └─────────────────┘
+│             │     │                  │     │  custom MCP     │
+│   Agent     │────▶│   MCP Firewall   │────▶│  (node server.js)│
+│  (Copilot)  │     │                  │     └─────────────────┘
 │             │     │  - Policy check  │     ┌─────────────────┐
-└─────────────┘     │  - Tool routing  │────▶│  icm MCP        │
-                    │  - Audit logging │     │  (agency mcp icm)│
+└─────────────┘     │  - Tool routing  │────▶│  custom MCP     │
+                    │  - Audit logging │     │  (python -m ...) │
                     └──────────────────┘     └─────────────────┘
-                                             ┌─────────────────┐
-                                        ────▶│  custom MCP     │
-                                             │  (node server.js)│
-                                             └─────────────────┘
 ```
 
 ### Configuration File Format
@@ -1343,23 +1302,11 @@ The firewall reads a JSON configuration file at runtime:
 ```json
 {
   "upstreams": {
-    "ado": {
-      "command": "agency",
-      "args": ["mcp", "ado"],
-      "env": {},
-      "allowed": ["*"]
-    },
-    "icm": {
-      "command": "agency",
-      "args": ["mcp", "icm"],
-      "env": {},
-      "allowed": ["create_incident", "get_incident"]
-    },
-    "kusto": {
-      "command": "agency",
-      "args": ["mcp", "kusto"],
-      "env": {},
-      "allowed": ["query"]
+    "data-processor": {
+      "command": "python",
+      "args": ["-m", "my_mcp_server"],
+      "env": { "DATA_DIR": "/data" },
+      "allowed": ["process_data", "query_database"]
     },
     "custom-tool": {
       "command": "node",
@@ -1398,9 +1345,8 @@ The `allowed` field supports several patterns:
 
 All tools exposed by the firewall are namespaced with their upstream name:
 
-- `ado:create-work-item` - from the `ado` upstream
-- `icm:create_incident` - from the `icm` upstream
-- `kusto:query` - from the `kusto` upstream
+- `data-processor:process_data` - from the `data-processor` upstream
+- `custom-tool:get_status` - from the `custom-tool` upstream
 
 This prevents tool name collisions and makes it clear which upstream handles each call.
 
@@ -1416,8 +1362,8 @@ ado-aw mcp-firewall --config /path/to/config.json
 The firewall is automatically configured in generated pipelines:
 
 1. **Config Generation**: The compiler generates `mcp-firewall-config.json` from the agent's `mcp-servers:` front matter
-2. **MCP Registration**: The firewall is registered in the agency MCP config as `mcp-firewall`
-3. **Runtime Launch**: When agency starts, it launches the firewall which spawns upstream MCPs
+2. **MCP Registration**: The firewall is registered in the copilot MCP config as `mcp-firewall`
+3. **Runtime Launch**: When copilot starts, it launches the firewall which spawns upstream MCPs
 
 The firewall config is written to `$(Agent.TempDirectory)/staging/mcp-firewall-config.json` in its own pipeline step, making it easy to inspect and debug.
 
@@ -1426,9 +1372,9 @@ The firewall config is written to `$(Agent.TempDirectory)/staging/mcp-firewall-c
 All tool call attempts are logged to the centralized log file at `$HOME/.ado-aw/logs/YYYY-MM-DD.log`:
 
 ```
-[2026-01-29T10:15:32Z] [INFO] [firewall] ALLOWED icm:create_incident (args: {"title": "...", "severity": 3})
-[2026-01-29T10:15:45Z] [INFO] [firewall] BLOCKED icm:delete_incident (not in allowlist)
-[2026-01-29T10:16:01Z] [INFO] [firewall] ALLOWED kusto:query (args: {"cluster": "...", "query": "..."})
+[2026-01-29T10:15:32Z] [INFO] [firewall] ALLOWED custom-tool:process_data (args: {"input": "..."})
+[2026-01-29T10:15:45Z] [INFO] [firewall] BLOCKED custom-tool:delete_all (not in allowlist)
+[2026-01-29T10:16:01Z] [INFO] [firewall] ALLOWED data-processor:query_database (args: {"query": "..."})
 ```
 
 This provides a complete audit trail of agent actions for security review.
